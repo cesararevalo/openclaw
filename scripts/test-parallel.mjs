@@ -94,7 +94,9 @@ const runs = [
       "run",
       "--config",
       "vitest.gateway.config.ts",
-      ...(useVmForks ? ["--pool=vmForks"] : []),
+      // Gateway tests are sensitive to vmForks behavior (global state + env stubs).
+      // Keep them on process forks for determinism even when other suites use vmForks.
+      "--pool=forks",
     ],
   },
 ];
@@ -123,8 +125,9 @@ const parallelRuns = keepGatewaySerial ? runs.filter((entry) => entry.name !== "
 const serialRuns = keepGatewaySerial ? runs.filter((entry) => entry.name === "gateway") : [];
 const localWorkers = Math.max(4, Math.min(16, os.cpus().length));
 const defaultUnitWorkers = localWorkers;
-const defaultExtensionsWorkers = Math.max(1, Math.min(4, Math.floor(localWorkers / 4)));
-const defaultGatewayWorkers = Math.max(1, Math.min(4, localWorkers));
+// Local perf: extensions tend to be the critical path under parallel vitest runs; give them more headroom.
+const defaultExtensionsWorkers = Math.max(1, Math.min(6, Math.floor(localWorkers / 2)));
+const defaultGatewayWorkers = Math.max(1, Math.min(2, Math.floor(localWorkers / 4)));
 
 // Keep worker counts predictable for local runs; trim macOS CI workers to avoid worker crashes/OOM.
 // In CI on linux/windows, prefer Vitest defaults to avoid cross-test interference from lower worker counts.
@@ -139,7 +142,8 @@ const maxWorkersForRun = (name) => {
     return 1;
   }
   if (name === "unit-isolated") {
-    return 1;
+    // Local: allow a bit of parallelism while keeping this run stable.
+    return Math.min(4, localWorkers);
   }
   if (name === "extensions") {
     return defaultExtensionsWorkers;
