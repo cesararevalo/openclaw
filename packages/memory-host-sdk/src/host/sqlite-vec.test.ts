@@ -1,3 +1,4 @@
+// Memory Host SDK tests cover sqlite vec behavior.
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -115,10 +116,10 @@ describe("loadSqliteVecExtension", () => {
       return;
     }
 
-    const require_ = createRequire(import.meta.url);
+    const requireForResolve = createRequire(import.meta.url);
     let expectedPath: string;
     try {
-      expectedPath = require_.resolve(`${entry.pkg}/${entry.file}`);
+      expectedPath = requireForResolve.resolve(`${entry.pkg}/${entry.file}`);
     } catch (err) {
       if (isMissingModuleError(err)) {
         return;

@@ -1,12 +1,14 @@
+/** Builds final reply payloads after sanitization, media normalization, and dedupe. */
 import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
-import { sanitizeUserFacingText } from "../../agents/pi-embedded-helpers/sanitize-user-facing-text.js";
-import type { MessagingToolSend } from "../../agents/pi-embedded-messaging.types.js";
+import { sanitizeUserFacingText } from "../../agents/embedded-agent-helpers/sanitize-user-facing-text.js";
+import type { MessagingToolSend } from "../../agents/embedded-agent-messaging.types.js";
 import type { ReplyToMode } from "../../config/types.js";
 import { logVerbose } from "../../globals.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { stripLegacyBracketToolCallBlocks } from "../../shared/text/assistant-visible-text.js";
 import { stripHeartbeatToken } from "../heartbeat.js";
 import {
+  appendReplyMediaFailureWarning,
   copyReplyPayloadMetadata,
   getReplyPayloadMetadata,
   setReplyPayloadMetadata,
@@ -35,6 +37,7 @@ function loadReplyPayloadsDedupeRuntime() {
 async function normalizeReplyPayloadMedia(params: {
   payload: ReplyPayload;
   normalizeMediaPaths?: (payload: ReplyPayload) => Promise<ReplyPayload>;
+  suppressMediaFailureWarning?: boolean;
 }): Promise<ReplyPayload> {
   if (!params.normalizeMediaPaths || !resolveSendableOutboundReplyParts(params.payload).hasMedia) {
     return params.payload;
@@ -45,8 +48,12 @@ async function normalizeReplyPayloadMedia(params: {
     return copyReplyPayloadMetadata(params.payload, normalized);
   } catch (err) {
     logVerbose(`reply payload media normalization failed: ${String(err)}`);
+    // Preserve the text reply and drop unusable media so channels can still send the answer.
     return copyReplyPayloadMetadata(params.payload, {
       ...params.payload,
+      text: params.suppressMediaFailureWarning
+        ? params.payload.text
+        : appendReplyMediaFailureWarning(params.payload.text),
       mediaUrl: undefined,
       mediaUrls: undefined,
       audioAsVoice: false,
@@ -150,6 +157,7 @@ function copyPayloadWithSanitizedText(
   return next;
 }
 
+/** Builds final outbound payloads from agent output and message-tool delivery evidence. */
 export async function buildReplyPayloads(params: {
   payloads: ReplyPayload[];
   isHeartbeat: boolean;
@@ -222,8 +230,9 @@ export async function buildReplyPayloads(params: {
       const mediaNormalizedPayload = await normalizeReplyPayloadMedia({
         payload: parsed.payload,
         normalizeMediaPaths: params.normalizeMediaPaths,
+        suppressMediaFailureWarning: parsed.isSilent,
       });
-      if (parsed.isSilent && !resolveSendableOutboundReplyParts(mediaNormalizedPayload).hasMedia) {
+      if (parsed.isSilent) {
         mediaNormalizedPayload.text = undefined;
       }
       return mediaNormalizedPayload;
@@ -324,7 +333,7 @@ export async function buildReplyPayloads(params: {
   const isDirectlySentBlockPayload = (payload: ReplyPayload) =>
     Boolean(params.directlySentBlockKeys?.has(createBlockReplyContentKey(payload)));
   const preserveUnsentMediaAfterBlockStream = (payload: ReplyPayload): ReplyPayload | null => {
-    if (payload.isError) {
+    if (payload.isError || payload.isFallbackNotice) {
       return payload;
     }
     const reply = resolveSendableOutboundReplyParts(payload);

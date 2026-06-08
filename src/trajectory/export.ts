@@ -1,8 +1,10 @@
+// Trajectory export helpers package recorded trajectories for diagnostics.
 import fsp from "node:fs/promises";
 import path from "node:path";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { FileEntry, SessionEntry, SessionHeader } from "@earendil-works/pi-coding-agent";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { sanitizeDiagnosticPayload } from "../agents/payload-redaction.js";
+import type { AgentMessage } from "../agents/runtime/index.js";
+import type { FileEntry, SessionEntry, SessionHeader } from "../agents/sessions/session-manager.js";
 import { resolveStateDir } from "../config/paths.js";
 import {
   jsonSupportBundleFile,
@@ -17,13 +19,10 @@ import {
   redactSupportString,
   type SupportRedactionContext,
 } from "../logging/diagnostic-support-redaction.js";
+import { redactSecrets, redactToolPayloadText } from "../logging/redact.js";
 import { safeJsonStringify } from "../utils/safe-json.js";
-import {
-  TRAJECTORY_RUNTIME_FILE_MAX_BYTES,
-  resolveTrajectoryFilePath,
-  resolveTrajectoryPointerFilePath,
-  safeTrajectorySessionFileName,
-} from "./paths.js";
+import { TRAJECTORY_RUNTIME_FILE_MAX_BYTES, safeTrajectorySessionFileName } from "./paths.js";
+import { isRegularNonSymlinkFile, resolveTrajectoryRuntimeFile } from "./runtime-file.js";
 import type {
   TrajectoryBundleManifest,
   TrajectoryBundleWarning,
@@ -31,6 +30,9 @@ import type {
   TrajectoryToolDefinition,
 } from "./types.js";
 
+// Trajectory bundle exporter: joins persisted session JSONL with runtime
+// trace JSONL, redacts local/support-sensitive data, and writes a portable
+// support bundle for debugging agent behavior.
 type BuildTrajectoryBundleParams = {
   outputDir: string;
   sessionFile: string;
@@ -66,10 +68,6 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
 function isSessionFileEntry(value: unknown): value is FileEntry {
   if (!isRecord(value) || typeof value.type !== "string") {
     return false;
@@ -84,9 +82,11 @@ function isSessionFileEntry(value: unknown): value is FileEntry {
 function parseSessionEntries(content: string): {
   entries: FileEntry[];
   warnings: JsonlParseWarning[];
+  rowByEntry: Map<FileEntry, number>;
 } {
   const entries: FileEntry[] = [];
   const warnings: JsonlParseWarning[] = [];
+  const rowByEntry = new Map<FileEntry, number>();
   const rows = content.split(/\r?\n/u);
   for (const [index, rawLine] of rows.entries()) {
     const line = rawLine.trim();
@@ -105,6 +105,7 @@ function parseSessionEntries(content: string): {
         continue;
       }
       entries.push(parsed);
+      rowByEntry.set(parsed, index + 1);
     } catch {
       warnings.push({
         source: "session",
@@ -114,13 +115,15 @@ function parseSessionEntries(content: string): {
       });
     }
   }
-  return { entries, warnings };
+  return { entries, warnings, rowByEntry };
 }
 
 function migrateLegacySessionEntries(entries: FileEntry[]): void {
   const header = entries.find((entry): entry is SessionHeader => entry.type === "session");
   const version = header?.version ?? 1;
   if (version < 2) {
+    // Older session logs predate entry ids. Synthetic ids preserve branch order
+    // long enough to export the reachable suffix without mutating source files.
     let previousId: string | null = null;
     let index = 0;
     for (const entry of entries) {
@@ -166,9 +169,11 @@ async function readSessionBranch(filePath: string): Promise<{
   branchEntries: SessionEntry[];
   warnings: JsonlParseWarning[];
 }> {
-  const { entries: fileEntries, warnings } = parseSessionEntries(
-    await fsp.readFile(filePath, "utf8"),
-  );
+  const {
+    entries: fileEntries,
+    warnings,
+    rowByEntry,
+  } = parseSessionEntries(await fsp.readFile(filePath, "utf8"));
   migrateLegacySessionEntries(fileEntries);
   const header =
     fileEntries.find((entry): entry is SessionHeader => entry.type === "session") ?? null;
@@ -182,10 +187,42 @@ async function readSessionBranch(filePath: string): Promise<{
   const byId = new Map(entries.map((entry) => [entry.id, entry]));
   const leafId = entries.at(-1)?.id ?? null;
   const branchEntries: SessionEntry[] = [];
-  let current = leafId ? byId.get(leafId) : undefined;
-  while (current) {
+  const seen = new Set<string>();
+  let currentId = leafId;
+  while (currentId) {
+    if (seen.has(currentId)) {
+      const cycleEntry = byId.get(currentId);
+      warnings.push({
+        source: "session",
+        code: "cyclic-session-branch",
+        row: cycleEntry ? (rowByEntry.get(cycleEntry) ?? 0) : 0,
+        message: "Stopped trajectory session branch export at a cyclic parent link.",
+      });
+      break;
+    }
+    seen.add(currentId);
+    const current = byId.get(currentId);
+    if (!current) {
+      warnings.push({
+        source: "session",
+        code: "incomplete-session-branch",
+        row: 0,
+        message: "Exported the reachable session branch suffix after a missing parent link.",
+      });
+      break;
+    }
     branchEntries.unshift(current);
-    current = current.parentId ? byId.get(current.parentId) : undefined;
+    const parentId = typeof current.parentId === "string" ? current.parentId : null;
+    if (parentId && !byId.has(parentId)) {
+      warnings.push({
+        source: "session",
+        code: "incomplete-session-branch",
+        row: rowByEntry.get(current) ?? 0,
+        message: "Exported the reachable session branch suffix after a missing parent link.",
+      });
+      break;
+    }
+    currentId = parentId;
   }
   return { header, leafId, branchEntries, warnings };
 }
@@ -296,81 +333,6 @@ function summarizeJsonlWarnings(warnings: JsonlParseWarning[]): TrajectoryBundle
   return [...byKey.values()];
 }
 
-async function isRegularNonSymlinkFile(filePath: string): Promise<boolean> {
-  try {
-    const linkStat = await fsp.lstat(filePath);
-    if (linkStat.isSymbolicLink() || !linkStat.isFile()) {
-      return false;
-    }
-    const stat = await fsp.stat(filePath);
-    return stat.isFile() && stat.dev === linkStat.dev && stat.ino === linkStat.ino;
-  } catch {
-    return false;
-  }
-}
-
-async function readRuntimePointerFile(
-  sessionFile: string,
-  sessionId: string,
-): Promise<string | undefined> {
-  const pointerPath = resolveTrajectoryPointerFilePath(sessionFile);
-  if (!(await isRegularNonSymlinkFile(pointerPath))) {
-    return undefined;
-  }
-  try {
-    const parsed = JSON.parse(await fsp.readFile(pointerPath, "utf8")) as unknown;
-    if (!isRecord(parsed)) {
-      return undefined;
-    }
-    if (parsed.sessionId !== sessionId || typeof parsed.runtimeFile !== "string") {
-      return undefined;
-    }
-    const runtimeFile = path.resolve(parsed.runtimeFile);
-    const safeRuntimeFileName = `${safeTrajectorySessionFileName(sessionId)}.jsonl`;
-    const defaultRuntimeFile = path.resolve(
-      resolveTrajectoryFilePath({
-        env: {},
-        sessionFile,
-        sessionId,
-      }),
-    );
-    if (runtimeFile !== defaultRuntimeFile && path.basename(runtimeFile) !== safeRuntimeFileName) {
-      return undefined;
-    }
-    return runtimeFile;
-  } catch {
-    return undefined;
-  }
-}
-
-async function resolveTrajectoryRuntimeFile(params: {
-  runtimeFile?: string;
-  sessionFile: string;
-  sessionId: string;
-}): Promise<string | undefined> {
-  if (params.runtimeFile) {
-    return params.runtimeFile;
-  }
-  const candidates = [
-    await readRuntimePointerFile(params.sessionFile, params.sessionId),
-    resolveTrajectoryFilePath({
-      env: {},
-      sessionFile: params.sessionFile,
-      sessionId: params.sessionId,
-    }),
-    resolveTrajectoryFilePath({
-      sessionFile: params.sessionFile,
-      sessionId: params.sessionId,
-    }),
-  ].filter((candidate): candidate is string => Boolean(candidate));
-  for (const candidate of candidates) {
-    if (await isRegularNonSymlinkFile(candidate)) {
-      return candidate;
-    }
-  }
-  return undefined;
-}
-
 function normalizeTimestamp(value: unknown): string {
   if (typeof value === "number" && Number.isFinite(value)) {
     const parsed = new Date(value);
@@ -432,6 +394,10 @@ function extractAssistantToolCalls(
       },
     ];
   });
+}
+
+function sanitizeTrajectoryExportValue<T>(value: T): T {
+  return redactSecrets(sanitizeDiagnosticPayload(value)) as T;
 }
 
 function buildTranscriptEvents(params: {
@@ -570,6 +536,15 @@ function trajectoryJsonlFile(
   return jsonlSupportBundleFile(pathName, lines);
 }
 
+function redactTrajectoryBundleFileContent(
+  file: DiagnosticSupportBundleFile,
+): DiagnosticSupportBundleFile {
+  return {
+    ...file,
+    content: redactToolPayloadText(file.content),
+  };
+}
+
 function buildTrajectoryExportRedaction(params: {
   workspaceDir: string;
 }): TrajectoryExportRedaction {
@@ -600,6 +575,8 @@ function redactWorkspacePathString(value: string, redaction: TrajectoryExportRed
 
 function maybeRedactPathString(value: string, redaction: TrajectoryExportRedaction): string {
   const workspaceRedacted = redactWorkspacePathString(value, redaction);
+  // Redact only strings that look path-like after workspace substitution. This
+  // keeps ordinary model text readable while still removing local host details.
   if (
     workspaceRedacted !== value ||
     path.isAbsolute(workspaceRedacted) ||
@@ -630,19 +607,57 @@ function redactLocalPathValues(value: unknown, redaction: TrajectoryExportRedact
   return next;
 }
 
+function uniqueRedactedObjectKey(key: string, usedKeys: Set<string>): string {
+  if (!usedKeys.has(key)) {
+    usedKeys.add(key);
+    return key;
+  }
+  let index = 2;
+  while (usedKeys.has(`${key}#${index}`)) {
+    index += 1;
+  }
+  const unique = `${key}#${index}`;
+  usedKeys.add(unique);
+  return unique;
+}
+
+function redactTrajectoryExportObjectKeys(
+  value: unknown,
+  redaction: TrajectoryExportRedaction,
+): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => redactTrajectoryExportObjectKeys(entry, redaction));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  const usedKeys = new Set<string>();
+  const next: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    const redactedKey = redactToolPayloadText(maybeRedactPathString(key, redaction));
+    // Object keys can contain file paths or tool payload snippets too. Preserve
+    // all entries even when redaction collapses two original keys together.
+    next[uniqueRedactedObjectKey(redactedKey, usedKeys)] = redactTrajectoryExportObjectKeys(
+      entry,
+      redaction,
+    );
+  }
+  return next;
+}
+
+function redactTrajectoryExportValue(
+  value: unknown,
+  redaction: TrajectoryExportRedaction,
+): unknown {
+  const redactedValue = sanitizeTrajectoryExportValue(redactLocalPathValues(value, redaction));
+  return redactTrajectoryExportObjectKeys(redactedValue, redaction);
+}
+
 function redactEventForExport(
   event: TrajectoryEvent,
   redaction: TrajectoryExportRedaction,
 ): TrajectoryEvent {
-  return {
-    ...event,
-    workspaceDir: event.workspaceDir
-      ? maybeRedactPathString(event.workspaceDir, redaction)
-      : undefined,
-    data: event.data
-      ? (redactLocalPathValues(event.data, redaction) as Record<string, unknown>)
-      : undefined,
-  };
+  return redactTrajectoryExportValue(event, redaction) as TrajectoryEvent;
 }
 
 function resolveRuntimeContext(runtimeEvents: TrajectoryEvent[]): RuntimeTrajectoryContext {
@@ -723,6 +738,8 @@ function markInvokedSkills(params: { skills: unknown; events: TrajectoryEvent[] 
       return collectPotentialPathStrings(event.data?.arguments);
     }),
   );
+  // Skill invocation is inferred from tool-call file paths in captured prompts;
+  // this keeps the export self-contained without re-reading skill state later.
   const normalizedInvokedPaths = new Set(
     [...invokedPaths].map((value) => normalizePathForMatch(value)),
   );
@@ -829,6 +846,10 @@ function buildArtifactsCapture(params: {
     promptError:
       runtimeArtifacts?.promptError ?? runtimeEnd?.promptError ?? runtimeCompletion?.promptError,
     promptErrorSource: runtimeArtifacts?.promptErrorSource ?? runtimeCompletion?.promptErrorSource,
+    terminalError:
+      runtimeArtifacts?.terminalError ??
+      runtimeEnd?.terminalError ??
+      runtimeCompletion?.terminalError,
     usage: runtimeArtifacts?.usage ?? runtimeCompletion?.usage,
     promptCache: runtimeArtifacts?.promptCache ?? runtimeCompletion?.promptCache,
     compactionCount: runtimeArtifacts?.compactionCount ?? runtimeCompletion?.compactionCount,
@@ -911,6 +932,8 @@ export function resolveDefaultTrajectoryExportDir(params: {
   );
 }
 
+// Public export API used by CLI/tests. The bundle is intentionally sanitized
+// before writing so sharing it should not expose credentials or local paths.
 export async function exportTrajectoryBundle(params: BuildTrajectoryBundleParams): Promise<{
   manifest: TrajectoryBundleManifest;
   outputDir: string;
@@ -1008,19 +1031,25 @@ export async function exportTrajectoryBundle(params: BuildTrajectoryBundleParams
   });
   if (metadataCapture) {
     files.push(
-      jsonSupportBundleFile("metadata.json", redactLocalPathValues(metadataCapture, redaction)),
+      jsonSupportBundleFile(
+        "metadata.json",
+        redactTrajectoryExportValue(metadataCapture, redaction),
+      ),
     );
     supplementalFiles.push("metadata.json");
   }
   if (artifactsCapture) {
     files.push(
-      jsonSupportBundleFile("artifacts.json", redactLocalPathValues(artifactsCapture, redaction)),
+      jsonSupportBundleFile(
+        "artifacts.json",
+        redactTrajectoryExportValue(artifactsCapture, redaction),
+      ),
     );
     supplementalFiles.push("artifacts.json");
   }
   if (promptsCapture) {
     files.push(
-      jsonSupportBundleFile("prompts.json", redactLocalPathValues(promptsCapture, redaction)),
+      jsonSupportBundleFile("prompts.json", redactTrajectoryExportValue(promptsCapture, redaction)),
     );
     supplementalFiles.push("prompts.json");
   }
@@ -1032,12 +1061,12 @@ export async function exportTrajectoryBundle(params: BuildTrajectoryBundleParams
   files.push(
     jsonSupportBundleFile(
       "session-branch.json",
-      redactLocalPathValues(
-        sanitizeDiagnosticPayload({
+      redactTrajectoryExportValue(
+        {
           header,
           leafId,
           entries: branchEntries,
-        }),
+        },
         redaction,
       ),
     ),
@@ -1046,7 +1075,7 @@ export async function exportTrajectoryBundle(params: BuildTrajectoryBundleParams
     files.push(
       textSupportBundleFile(
         "system-prompt.txt",
-        redactLocalPathValues(bundleRuntimeContext.systemPrompt, redaction) as string,
+        redactTrajectoryExportValue(bundleRuntimeContext.systemPrompt, redaction) as string,
       ),
     );
   }
@@ -1054,21 +1083,29 @@ export async function exportTrajectoryBundle(params: BuildTrajectoryBundleParams
     files.push(
       jsonSupportBundleFile(
         "tools.json",
-        redactLocalPathValues(bundleRuntimeContext.tools, redaction),
+        redactTrajectoryExportValue(bundleRuntimeContext.tools, redaction),
       ),
     );
   }
 
-  const contents: DiagnosticSupportBundleContent[] = [...supportBundleContents(files)];
+  const redactedFiles = files.map(redactTrajectoryBundleFileContent);
+  const contents: DiagnosticSupportBundleContent[] = [...supportBundleContents(redactedFiles)];
   manifest.contents = contents;
+  const redactedManifest = redactTrajectoryExportValue(
+    manifest,
+    redaction,
+  ) as TrajectoryBundleManifest;
+  const manifestFile = redactTrajectoryBundleFileContent(
+    jsonSupportBundleFile("manifest.json", redactedManifest),
+  );
 
   await writeSupportBundleDirectory({
     outputDir: params.outputDir,
-    files: [jsonSupportBundleFile("manifest.json", manifest), ...files],
+    files: [manifestFile, ...redactedFiles],
   });
 
   return {
-    manifest,
+    manifest: redactedManifest,
     outputDir: params.outputDir,
     events,
     header,

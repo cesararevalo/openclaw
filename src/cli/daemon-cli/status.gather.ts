@@ -1,4 +1,6 @@
+// Collects daemon status from service files, config snapshots, ports, probes, and plugin drift.
 import fs from "node:fs/promises";
+import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import JSON5 from "json5";
 import {
   createConfigIO,
@@ -26,7 +28,9 @@ import {
 import { parseStrictPositiveInteger } from "../../infra/parse-finite-number.js";
 import {
   formatPortDiagnostics,
+  inspectPortConnections,
   inspectPortUsage,
+  type PortConnection,
   type PortListener,
   type PortUsageStatus,
 } from "../../infra/ports.js";
@@ -35,6 +39,11 @@ import {
   type GatewayRestartHandoff,
 } from "../../infra/restart-handoff.js";
 import { resolveConfiguredLogFilePath } from "../../logging/log-file-path.js";
+import { loadInstalledPluginIndexInstallRecords } from "../../plugins/installed-plugin-index-record-reader.js";
+import {
+  detectPluginVersionDrift,
+  type PluginVersionDriftReport,
+} from "../../plugins/plugin-version-drift.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { VERSION } from "../../version.js";
 import { normalizeListenerAddress, parsePortFromArgs, pickProbeHostForBind } from "./shared.js";
@@ -58,6 +67,7 @@ type GatewayStatusSummary = {
   portSource: "service args" | "env/config";
   probeUrl: string;
   probeNote?: string;
+  version?: string | null;
 };
 
 type PortStatusSummary = {
@@ -150,14 +160,12 @@ function coerceStatusConfig(value: unknown): OpenClawConfig {
 
 function hasOwnKey(value: unknown, key: string): boolean {
   return Boolean(
-    value &&
-    typeof value === "object" &&
-    !Array.isArray(value) &&
-    Object.prototype.hasOwnProperty.call(value, key),
+    value && typeof value === "object" && !Array.isArray(value) && Object.hasOwn(value, key),
   );
 }
 
 function needsFullStatusConfigRead(raw: string, parsed: unknown): boolean {
+  // Fast reads skip config expansion; includes/env placeholders require full config IO.
   return raw.includes("$include") || raw.includes("${") || hasOwnKey(parsed, "env");
 }
 
@@ -255,7 +263,7 @@ function appendProbeNote(
   if (values.length === 0) {
     return undefined;
   }
-  return [...new Set(values)].join(" ");
+  return uniqueStrings(values).join(" ");
 }
 export type DaemonStatus = {
   cli?: CliStatusSummary;
@@ -294,6 +302,10 @@ export type DaemonStatus = {
     listeners: PortListener[];
     hints: string[];
   };
+  connections?: {
+    port: number;
+    established: PortConnection[];
+  };
   lastError?: string;
   rpc?: {
     ok: boolean;
@@ -308,6 +320,7 @@ export type DaemonStatus = {
       version?: string | null;
       connId?: string | null;
     };
+    version?: string | null;
     error?: string;
     url?: string;
     authWarning?: string;
@@ -317,6 +330,13 @@ export type DaemonStatus = {
     staleGatewayPids: number[];
   };
   extraServices: Array<{ label: string; detail: string; scope: string }>;
+  /**
+   * Plugin version drift report. Surfaces active official external plugins
+   * whose installed version does not match the running gateway version, which
+   * can happen after `npm install -g openclaw@<v>` updates the gateway binary
+   * without a corresponding `openclaw plugins update`.
+   */
+  pluginVersionDrift?: PluginVersionDriftReport;
 };
 
 function shouldReportPortUsage(status: PortUsageStatus | undefined, rpcOk?: boolean) {
@@ -460,6 +480,27 @@ async function inspectDaemonPortStatuses(params: {
   };
 }
 
+async function inspectEstablishedGatewayClients(params: {
+  daemonPort: number;
+  deep?: boolean;
+  gatewayMode?: string;
+}): Promise<DaemonStatus["connections"] | undefined> {
+  if (params.deep !== true || params.gatewayMode === "remote") {
+    return undefined;
+  }
+  const result = await inspectPortConnections(params.daemonPort).catch(() => null);
+  const establishedClients = result?.connections.filter(
+    (connection) => connection.direction !== "server",
+  );
+  if (!result || !establishedClients || establishedClients.length === 0) {
+    return undefined;
+  }
+  return {
+    port: result.port,
+    established: establishedClients,
+  };
+}
+
 export async function gatherDaemonStatus(
   opts: {
     rpc: GatewayRpcOpts;
@@ -478,7 +519,9 @@ export async function gatherDaemonStatus(
     : process.env;
   const [loaded, runtime] = await Promise.all([
     service.isLoaded({ env: serviceEnv }).catch(() => false),
-    service.readRuntime(serviceEnv).catch((err) => ({ status: "unknown", detail: String(err) })),
+    service
+      .readRuntime(serviceEnv)
+      .catch((err: unknown) => ({ status: "unknown", detail: String(err) })),
   ]);
   const restartHandoff = opts.deep ? readGatewayRestartHandoffSync(serviceEnv) : null;
   const configAudit = command
@@ -508,6 +551,11 @@ export async function gatherDaemonStatus(
     daemonPort,
     cliPort,
   });
+  const establishedClients = await inspectEstablishedGatewayClients({
+    daemonPort,
+    deep: opts.deep,
+    gatewayMode: daemonCfg.gateway?.mode,
+  });
 
   const extraServices = opts.deep
     ? await loadDaemonInspectModule()
@@ -521,7 +569,9 @@ export async function gatherDaemonStatus(
   const staleUpdateLaunchdJobs =
     opts.deep && process.platform === "darwin"
       ? await loadLaunchdModule()
-          .then(({ findStaleOpenClawUpdateLaunchdJobs }) => findStaleOpenClawUpdateLaunchdJobs())
+          .then(({ findStaleOpenClawUpdateLaunchdJobs }) =>
+            findStaleOpenClawUpdateLaunchdJobs(serviceEnv),
+          )
           .catch(() => [])
       : [];
 
@@ -590,10 +640,39 @@ export async function gatherDaemonStatus(
           )
           .catch(() => undefined)
       : undefined;
+  const gatewayVersion = opts.probe
+    ? ((rpc && "server" in rpc ? rpc.server?.version : undefined) ??
+      (rpc && "version" in rpc ? rpc.version : undefined) ??
+      null)
+    : undefined;
 
   let lastError: string | undefined;
   if (loaded && runtime?.status === "running" && portStatus && portStatus.status !== "busy") {
     lastError = (await readLastGatewayErrorLine(mergedDaemonEnv as NodeJS.ProcessEnv)) ?? undefined;
+  }
+
+  // Plugin version drift detection.
+  // Compares active official external plugins against the *running* local
+  // gateway version reported by the probe handshake, falling back to the
+  // invoking CLI VERSION only when no gateway version is available. Reading
+  // records with the merged daemon environment inspects the managed service's
+  // profile/state dir, so remote/explicit URL probes need remote-owned
+  // diagnostics instead.
+  // Best-effort: unreadable install records omit this advisory report.
+  let pluginVersionDrift: PluginVersionDriftReport | undefined;
+  if (daemonCfg.gateway?.mode !== "remote" && !probeUrlOverride) {
+    try {
+      const installRecords = await loadInstalledPluginIndexInstallRecords({
+        env: mergedDaemonEnv as NodeJS.ProcessEnv,
+      });
+      pluginVersionDrift = detectPluginVersionDrift({
+        gatewayVersion: gatewayVersion ?? VERSION,
+        installRecords,
+        config: daemonCfg,
+      });
+    } catch {
+      pluginVersionDrift = undefined;
+    }
   }
 
   return {
@@ -615,9 +694,17 @@ export async function gatherDaemonStatus(
       daemon: daemonConfigSummary,
       ...(configMismatch ? { mismatch: true } : {}),
     },
-    gateway,
+    gateway: {
+      ...gateway,
+      ...(opts.probe
+        ? {
+            version: gatewayVersion,
+          }
+        : {}),
+    },
     port: portStatus,
     ...(portCliStatus ? { portCli: portCliStatus } : {}),
+    ...(establishedClients ? { connections: establishedClients } : {}),
     lastError,
     ...(rpc
       ? {
@@ -637,6 +724,7 @@ export async function gatherDaemonStatus(
         }
       : {}),
     extraServices,
+    ...(pluginVersionDrift ? { pluginVersionDrift } : {}),
   };
 }
 

@@ -1,3 +1,4 @@
+// Browser tests cover pw tools core ssrf guard plugin behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const pageState = vi.hoisted(() => ({
@@ -17,7 +18,9 @@ const sessionMocks = vi.hoisted(() => ({
     return pageState.page;
   }),
   gotoPageWithNavigationGuard: vi.fn(async () => null),
+  isBrowserObservedDialogBlockedError: vi.fn(() => false),
   isPolicyDenyNavigationError: vi.fn(() => false),
+  markObservedDialogsHandledRemotelyForPage: vi.fn(() => ({})),
   refLocator: vi.fn(() => {
     if (!pageState.locator) {
       throw new Error("missing locator");
